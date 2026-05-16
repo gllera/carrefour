@@ -153,7 +153,11 @@ async function extractProducts(page) {
         name,
         brand,
         url,
-        imageUrl: img ? img.getAttribute('src') : null,
+        // Carrefour uses a Vue lazy-load directive: real URL lives in data-src
+        // and src holds a base64 LQIP placeholder until the image enters the
+        // viewport. We block image requests for speed, so the swap never
+        // completes for off-screen cards — read data-src first.
+        imageUrl: img ? (img.getAttribute('data-src') || img.getAttribute('src')) : null,
         imageAlt: img ? img.getAttribute('alt') : null,
         priceText,
         price: parsePrice(priceText),
