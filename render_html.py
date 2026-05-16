@@ -14,7 +14,10 @@ def fmt_price(value, fallback=None):
 
 def render(products_path: str = 'products.json', out_path: str = 'products.html') -> None:
     data = json.loads(Path(products_path).read_text())
-    products = data['products']
+    all_products = data['products']
+    # Hide products without an accessible product page.
+    products = [p for p in all_products if p.get('accessible') is not False]
+    hidden_count = len(all_products) - len(products)
 
     # Stats
     total = len(products)
@@ -23,14 +26,10 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
     prices = [p['price'] for p in products if p.get('price') is not None]
     price_min = min(prices) if prices else 0
     price_max = max(prices) if prices else 0
-    accessible_count = sum(1 for p in products if p.get('accessible'))
-    inaccessible_count = sum(1 for p in products if p.get('accessible') is False)
-    validation_note = ''
-    if 'urlValidation' in data:
-        validation_note = (
-            f' · <strong>{accessible_count}</strong> accesibles, '
-            f'<strong>{inaccessible_count}</strong> sin página de producto'
-        )
+    hidden_note = (
+        f' · <strong>{hidden_count}</strong> no disponibles ocultos'
+        if hidden_count else ''
+    )
 
     # Inline the products as JSON so search/filtering runs purely client-side
     payload = json.dumps(products, ensure_ascii=False)
@@ -98,14 +97,6 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
     position: relative;
   }}
   .card:hover {{ transform: translateY(-2px); box-shadow: 0 4px 12px rgba(15,23,42,.10); }}
-  .card.unavailable .imgwrap img {{ filter: grayscale(60%) opacity(.7); }}
-  .card.unavailable .body {{ opacity: .85; }}
-  .card .unavailable-flag {{
-    position: absolute; right: 8px; top: 8px;
-    font-size: 11px; font-weight: 600;
-    color: #fff; padding: 4px 8px; border-radius: 999px;
-    background: #6b7280;
-  }}
   .card .imgwrap {{
     aspect-ratio: 1 / 1;
     background: #fafafa;
@@ -156,12 +147,11 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
 <body>
 <header>
   <h1>Carrefour · ofertas</h1>
-  <span class="meta">{total} productos · {len(brands)} marcas · {fmt_price(price_min)} – {fmt_price(price_max)}{validation_note}</span>
+  <span class="meta">{total} productos · {len(brands)} marcas · {fmt_price(price_min)} – {fmt_price(price_max)}{hidden_note}</span>
   <div class="controls">
     <input id="q" type="search" placeholder="Buscar producto, marca…" autocomplete="off">
     <select id="brand"><option value="">Todas las marcas</option></select>
     <select id="promo"><option value="">Todas las promociones</option></select>
-    <select id="access"><option value="">Disponibles + no disponibles</option><option value="accessible">Solo disponibles</option><option value="inaccessible">Solo no disponibles</option></select>
     <select id="sort">
       <option value="default">Orden original</option>
       <option value="priceAsc">Precio: menor a mayor</option>
@@ -189,7 +179,6 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
   const qEl = document.getElementById('q');
   const brandEl = document.getElementById('brand');
   const promoEl = document.getElementById('promo');
-  const accessEl = document.getElementById('access');
   const sortEl = document.getElementById('sort');
 
   // populate filter options
@@ -211,17 +200,11 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
   function renderCard(p) {{
     const promoTitle = p.promo && p.promo.title;
     const promoColor = (p.promo && p.promo.color) || '#A63793';
-    const inaccessible = p.accessible === false;
-    const href = inaccessible ? (p.redirectsTo || p.url || '#') : (p.url || '#');
-    const titleAttr = inaccessible
-      ? 'title="Página de producto no disponible — el enlace lleva a la categoría"'
-      : '';
     return `
-      <a class="card${{inaccessible ? ' unavailable' : ''}}" href="${{href}}" target="_blank" rel="noopener" ${{titleAttr}}>
+      <a class="card" href="${{p.url || '#'}}" target="_blank" rel="noopener">
         <div class="imgwrap">
           ${{p.imageUrl ? `<img loading="lazy" src="${{p.imageUrl}}" alt="">` : ''}}
           ${{promoTitle ? `<span class="badge" style="background:${{promoColor}}">${{promoTitle}}</span>` : ''}}
-          ${{inaccessible ? `<span class="unavailable-flag">No disponible</span>` : ''}}
         </div>
         <div class="body">
           <div class="brand">${{p.brand || ''}}</div>
@@ -238,12 +221,9 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
     const brand = brandEl.value;
     const promo = promoEl.value;
     const sort = sortEl.value;
-    const access = accessEl.value;
     let rows = PRODUCTS.filter(p => {{
       if (brand && p.brand !== brand) return false;
       if (promo && (!p.promo || p.promo.title !== promo)) return false;
-      if (access === 'accessible' && p.accessible === false) return false;
-      if (access === 'inaccessible' && p.accessible !== false) return false;
       if (q) {{
         const hay = norm(p.name) + ' ' + norm(p.brand);
         if (!hay.includes(q)) return false;
@@ -261,7 +241,6 @@ def render(products_path: str = 'products.json', out_path: str = 'products.html'
   qEl.addEventListener('input', apply);
   brandEl.addEventListener('change', apply);
   promoEl.addEventListener('change', apply);
-  accessEl.addEventListener('change', apply);
   sortEl.addEventListener('change', apply);
   apply();
 </script>
