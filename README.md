@@ -43,10 +43,29 @@ node scrape.js https://www.carrefour.es/.../g lacteos
 - `products.json` — payload completo con metadatos, resumen por campaña y todos los productos.
 - `products.csv` — fila por producto, columnas clave para hojas de cálculo.
 - `products.html` — página estática con todos los productos embebidos: búsqueda por nombre/marca, filtro por marca y promoción, orden por precio o nombre. Funciona offline.
+- `products.ai.json` — vista compacta y enriquecida para análisis con un LLM (~75% más pequeña que `products.json`). Ver abajo.
+- `products.report.md` — resumen determinista en Markdown: mejores descuentos, precio por unidad más barato, desglose de promociones, ofertas por categoría y marcas con más ofertas.
 
-### Campos por producto
+### Campos por producto (`products.json`)
 
 `productId`, `name`, `brand`, `url`, `imageUrl`, `price`, `originalPrice`, `pricePerUnit`, `priceText`, `discountText`, `promo` (título, color, descripción, válido hasta, URL de campaña), `catalog`, `documentType`, `pageNumber`, `positionOnPage`, `sourceUrl`.
+
+### Salida para IA (`products.ai.json`, esquema `carrefour-ai/1`)
+
+Generada por `analyze.js`. Quita campos redundantes, deduplica las promociones en una tabla de consulta y añade señales calculadas para que un LLM no tenga que recomputarlas:
+
+- **`promos[]`** — tabla de promociones únicas (en lugar de repetir el texto en cada producto). Cada una con `type` (`second-unit`, `multibuy`, `cashback-coupon`, `bulk`, `price-flag`, `shipping`, `bundle`, `stacking`, `themed`…), `effectiveDiscountPct` estimado, `deferred` (cupones que se devuelven en una compra posterior) y `validFrom`/`validUntil` en ISO.
+- **`products[]`** — por producto: `id`, `name`, `brand`, `price`, `wasPrice`/`discountPct` (sólo si había precio tachado), `unit` + `unitPrice` (€/kg, €/l, €/ud…), `category` (inferida del nombre), `promo` (índice en `promos[]`) y `url`.
+- **`summary`** — agregados ya calculados: rango y mediana de precios, conteos por tipo de promoción, desglose por promoción (`promoBreakdown`), categorías, marcas top, lo más barato por unidad de medida y los mayores descuentos inmediatos.
+
+`effectiveDiscountPct` es una **estimación** del descuento inmediato si se cumple la base de la oferta (p. ej. comprar 2 uds); los cupones `deferred` se devuelven en una compra posterior, no son una rebaja inmediata.
+
+`analyze.js` también funciona de forma independiente sobre un scrape existente, sin volver a scrapear:
+
+```bash
+node analyze.js products.json            # → products.ai.json + products.report.md
+node analyze.js products.json salida     # prefijo de salida personalizado
+```
 
 ## Notas
 
