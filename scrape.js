@@ -18,6 +18,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const fs = require('fs');
 const path = require('path');
+const { buildAiPayload, renderReport } = require('./analyze');
 
 const DEFAULT_URL = 'https://www.carrefour.es/supermercado/ofertas/cat20968591/c';
 const ORIGIN = 'https://www.carrefour.es';
@@ -423,8 +424,33 @@ async function newWorkerPage(browser) {
 }
 
 (async () => {
-  const baseUrl = process.argv[2] || DEFAULT_URL;
-  const outBase = process.argv[3] || 'products';
+  const rawArgs = process.argv.slice(2);
+  const force = rawArgs.includes('--force') || process.env.SCRAPE_FORCE === '1';
+  const positional = rawArgs.filter((a) => !a.startsWith('--'));
+  const baseUrl = positional[0] || DEFAULT_URL;
+  const outBase = positional[1] || 'products';
+  // Outputs — and the same-day cache — live in OUT_DIR: the mounted volume in
+  // Docker (Dockerfile sets ENV OUT_DIR=/output), or cwd for a direct run.
+  const outDir = process.env.OUT_DIR || process.cwd();
+  const outPath = (ext) => path.resolve(outDir, `${outBase}.${ext}`);
+
+  // The offers don't change within a day, so a second run today is wasted work
+  // (and risks rate limits). If we already have today's scrape, reuse it as the
+  // cache and stop. --force / SCRAPE_FORCE=1 overrides.
+  if (!force && fs.existsSync(outPath('json'))) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(outPath('json'), 'utf8'));
+      const prevDay = String(prev.scrapedAt || '').slice(0, 10);
+      if (prevDay === new Date().toISOString().slice(0, 10)) {
+        const n = prev.collected ?? prev.products?.length ?? '?';
+        console.log(`Carrefour scraper: ya scrapeado hoy (${prev.scrapedAt}, ${n} productos).`);
+        console.log(`Usando el resultado en cache -> ${outPath('json')}`);
+        console.log(`(usa --force o SCRAPE_FORCE=1 para volver a scrapear)`);
+        return;
+      }
+    } catch { /* unreadable / pre-cache file — fall through and scrape */ }
+  }
+
   const isHub = /\/c(?:[?#].*)?$/.test(baseUrl);
   const requestedWorkers = parseInt(process.env.SCRAPE_WORKERS, 10);
   const workers = isHub
@@ -434,7 +460,7 @@ async function newWorkerPage(browser) {
   console.log('Carrefour scraper');
   console.log('  base URL:', baseUrl);
   console.log('  mode:    ', isHub ? `hub (walk every /g campaign, ${workers} workers)` : 'single listing');
-  console.log('  out:     ', `${outBase}.json`, `${outBase}.csv`, `${outBase}.html`);
+  console.log('  out:     ', `${outDir}/${outBase}.{json,csv,html,ai.json,report.md}`);
   console.log();
 
   const browser = await puppeteer.launch({
@@ -511,9 +537,11 @@ async function newWorkerPage(browser) {
     // Persist results
     const ordered = [...seen.values()];
     const reportedTotal = summaries.reduce((s, c) => s + (c.total || 0), 0);
-    const jsonPath = path.resolve(`${outBase}.json`);
-    const csvPath = path.resolve(`${outBase}.csv`);
-    const htmlPath = path.resolve(`${outBase}.html`);
+    const jsonPath = outPath('json');
+    const csvPath = outPath('csv');
+    const htmlPath = outPath('html');
+    const aiPath = outPath('ai.json');
+    const reportPath = outPath('report.md');
     const payload = {
       scrapedAt: new Date().toISOString(),
       sourceUrl: baseUrl,
@@ -527,11 +555,21 @@ async function newWorkerPage(browser) {
     fs.writeFileSync(csvPath, toCsv(ordered));
     const htmlInfo = renderHtml(payload, htmlPath);
 
+    // AI-friendly artifacts: a compact, enriched, denormalized JSON for LLMs
+    // and a deterministic Markdown digest. Built from a shallow copy carrying
+    // postalCode so products.json itself stays unchanged.
+    const ai = buildAiPayload({ ...payload, postalCode: POSTAL_CODE });
+    fs.writeFileSync(aiPath, JSON.stringify(ai));
+    fs.writeFileSync(reportPath, renderReport(ai));
+    const kb = (p) => Math.round(fs.statSync(p).size / 1024);
+
     console.log();
     console.log(`✓ collected ${ordered.length} unique products across ${summaries.length} campaign(s) (sum of campaign totals: ${reportedTotal})`);
-    console.log(`✓ saved JSON → ${jsonPath}`);
-    console.log(`✓ saved CSV  → ${csvPath}`);
-    console.log(`✓ saved HTML → ${htmlPath} (${htmlInfo.total} products, ${htmlInfo.sizeKb} KB)`);
+    console.log(`✓ saved JSON   → ${jsonPath}`);
+    console.log(`✓ saved CSV    → ${csvPath}`);
+    console.log(`✓ saved HTML   → ${htmlPath} (${htmlInfo.total} products, ${htmlInfo.sizeKb} KB)`);
+    console.log(`✓ saved AI     → ${aiPath} (${ai.products.length} products, ${ai.promos.length} promos, ${kb(aiPath)} KB)`);
+    console.log(`✓ saved report → ${reportPath} (${kb(reportPath)} KB)`);
   } finally {
     await browser.close();
   }
