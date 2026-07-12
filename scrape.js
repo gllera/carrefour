@@ -18,11 +18,19 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const fs = require('fs');
 const path = require('path');
-const { buildAiPayload, renderReport } = require('./analyze');
+const { buildAiPayload, renderReport, inferCategory } = require('./analyze');
 
 const DEFAULT_URL = 'https://www.carrefour.es/supermercado/ofertas/cat20968591/c';
 const ORIGIN = 'https://www.carrefour.es';
 const POSTAL_CODE = '28904';
+// The promo grids list Carrefour's NATIONAL catalog, but each shopper is pinned
+// to one store ("sale point") whose assortment is only a subset. A product in a
+// grid but not in the store redirects to its category when opened — the "broken
+// links" a shopper hits. We reproduce the target store during link verification
+// (see verifyAccessibility) with this cookie so we can drop what they can't open.
+// Format: <storeId>||<postal>|<deliveryMode>|<n>, copied from a live session's
+// `salepoint` cookie. Change it if the offers page should target another store.
+const SALEPOINT = '005704||28904|A_DOMICILIO|0';
 const PAGE_SIZE = 24;
 const NAV_TIMEOUT_MS = 90_000;
 const RETRIES_PER_PAGE = 3;
@@ -182,8 +190,15 @@ function renderHtml(payload, outPath) {
   const priceMin = prices.length ? Math.min(...prices) : 0;
   const priceMax = prices.length ? Math.max(...prices) : 0;
   const hiddenNote = hiddenCount ? ` · <strong>${hiddenCount}</strong> no disponibles ocultos` : '';
+  // Human date for the header ("12 jul 2026, 23:16"); raw ISO kept in a title tooltip.
+  const updatedAt = new Intl.DateTimeFormat('es-ES', {
+    dateStyle: 'medium', timeStyle: 'short', timeZone: 'Europe/Madrid',
+  }).format(new Date(payload.scrapedAt));
+  // Tag each product with an inferred type so the page can group by category
+  // (the same heuristic the AI report uses); uncategorized → "Otros".
+  const tagged = products.map((p) => ({ ...p, category: inferCategory(p.name) || 'Otros' }));
   // Escape `<` so a stray `</script>` in product names can't close the tag.
-  const dataJson = JSON.stringify(products).replace(/</g, '\\u003c');
+  const dataJson = JSON.stringify(tagged).replace(/</g, '\\u003c');
 
   fs.writeFileSync(outPath, `<!doctype html>
 <html lang="es">
@@ -218,6 +233,13 @@ function renderHtml(payload, outPath) {
   .card .name { font-size: 13px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; min-height: calc(13px * 1.35 * 3); margin-bottom: 8px; }
   .card .price { font-weight: 700; font-size: 17px; color: var(--price); margin-top: auto; }
   .card .ppu { color: var(--muted); font-size: 12px; }
+  .controls label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; user-select: none; }
+  .group-title { display: flex; align-items: center; gap: 8px; width: 100%; margin: 20px 0 12px; padding: 0 0 6px; border: 0; border-bottom: 1px solid #e5e7eb; background: none; font: inherit; font-size: 15px; font-weight: 700; color: var(--accent); text-align: left; cursor: pointer; }
+  .group:first-child .group-title { margin-top: 0; }
+  .group-title .n { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .group-title .caret { display: inline-block; font-size: 11px; transition: transform .15s; }
+  .group:not(.collapsed) .group-title .caret { transform: rotate(90deg); }
+  .group.collapsed .grid { display: none; }
   .empty { text-align: center; padding: 60px 20px; color: var(--muted); }
   footer { padding: 24px; text-align: center; color: var(--muted); font-size: 12px; }
   a { color: var(--accent); }
@@ -226,17 +248,18 @@ function renderHtml(payload, outPath) {
 <body>
 <header>
   <h1>Carrefour · ofertas</h1>
-  <span class="meta">${products.length} productos · ${brands.size} marcas · ${fmtPrice(priceMin)} – ${fmtPrice(priceMax)}${hiddenNote}</span>
+  <span class="meta">${products.length} productos · ${brands.size} marcas · ${fmtPrice(priceMin)} – ${fmtPrice(priceMax)}${hiddenNote} · <span title="${escapeHtml(payload.scrapedAt)}">Actualizado ${escapeHtml(updatedAt)}</span></span>
   <div class="controls">
     <input id="q" type="search" placeholder="Buscar producto, marca…" autocomplete="off">
     <select id="brand"><option value="">Todas las marcas</option></select>
     <select id="promo"><option value="">Todas las promociones</option></select>
     <select id="sort">
+      <option value="nameAsc">Nombre A–Z</option>
       <option value="default">Orden original</option>
       <option value="priceAsc">Precio: menor a mayor</option>
       <option value="priceDesc">Precio: mayor a menor</option>
-      <option value="nameAsc">Nombre A–Z</option>
     </select>
+    <label class="check"><input id="group" type="checkbox" checked> Agrupar por tipo</label>
     <span id="count"></span>
   </div>
 </header>
@@ -247,14 +270,14 @@ function renderHtml(payload, outPath) {
 <footer>
   Datos obtenidos de
   <a href="${escapeHtml(payload.sourceUrl)}" target="_blank" rel="noopener">carrefour.es</a>
-  el ${escapeHtml(payload.scrapedAt)}
 </footer>
 <script id="data" type="application/json">${dataJson}</script>
 <script>
   const PRODUCTS = JSON.parse(document.getElementById('data').textContent);
   const $ = (id) => document.getElementById(id);
   const grid = $('grid'), countEl = $('count'), emptyEl = $('empty');
-  const qEl = $('q'), brandEl = $('brand'), promoEl = $('promo'), sortEl = $('sort');
+  const collapsed = new Set();  // product types the user has collapsed (kept across re-renders)
+  const qEl = $('q'), brandEl = $('brand'), promoEl = $('promo'), sortEl = $('sort'), groupEl = $('group');
 
   const uniq = (key) => [...new Set(PRODUCTS
       .map(p => key === 'promo' ? p.promo?.title : p[key])
@@ -299,13 +322,49 @@ function renderHtml(payload, outPath) {
     if (sort === 'priceAsc') rows.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
     else if (sort === 'priceDesc') rows.sort((a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity));
     else if (sort === 'nameAsc') rows.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'es'));
-    grid.innerHTML = rows.map(renderCard).join('');
+    if (groupEl.checked) {
+      // Group by product type; keep the current sort within each group, order
+      // the headings alphabetically with "Otros" last, and make each heading a
+      // toggle that collapses/expands its cards (state in the collapsed set).
+      grid.className = '';
+      const groups = new Map();
+      for (const p of rows) {
+        const k = p.category || 'Otros';
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(p);
+      }
+      const names = [...groups.keys()].sort((a, b) =>
+        a === 'Otros' ? 1 : b === 'Otros' ? -1 : a.localeCompare(b, 'es'));
+      grid.innerHTML = names.map((name) => {
+        const items = groups.get(name);
+        const col = collapsed.has(name);
+        return \`<section class="group\${col ? ' collapsed' : ''}" data-cat="\${name}">\`
+          + \`<button class="group-title" type="button" aria-expanded="\${!col}">\`
+          + \`<span class="caret">▸</span><span>\${name}</span> <span class="n">(\${items.length})</span></button>\`
+          + \`<div class="grid">\${items.map(renderCard).join('')}</div>\`
+          + \`</section>\`;
+      }).join('');
+    } else {
+      grid.className = 'grid';
+      grid.innerHTML = rows.map(renderCard).join('');
+    }
     emptyEl.hidden = rows.length > 0;
     countEl.textContent = \`\${rows.length} / \${PRODUCTS.length}\`;
   }
 
   qEl.addEventListener('input', apply);
-  for (const el of [brandEl, promoEl, sortEl]) el.addEventListener('change', apply);
+  for (const el of [brandEl, promoEl, sortEl, groupEl]) el.addEventListener('change', apply);
+  // Toggle a group open/closed when its heading is clicked.
+  grid.addEventListener('click', (e) => {
+    const btn = e.target.closest('.group-title');
+    if (!btn) return;
+    const section = btn.closest('.group');
+    const cat = section.dataset.cat;
+    const col = !collapsed.has(cat);
+    if (col) collapsed.add(cat); else collapsed.delete(cat);
+    section.classList.toggle('collapsed', col);
+    btn.setAttribute('aria-expanded', String(!col));
+  });
   apply();
 </script>
 </body>
@@ -423,7 +482,116 @@ async function newWorkerPage(browser) {
   return { ctx, page };
 }
 
-(async () => {
+// Carrefour's promo grids list the national catalog, but each shopper is pinned
+// to one store whose assortment is a subset — a product in the grid but not in
+// the store redirects to its category (a dead link) when opened. Reproduce the
+// target store with the `salepoint` cookie, then HEAD each product URL following
+// redirects: a live product lands on a /p URL, a store-missing one on /c (or the
+// homepage). Mark the misses accessible:false so renderHtml and buildAiPayload
+// drop them (they already filter on that flag). Only a definitive 200-not-on-/p
+// hides a product; a non-200 or a network error leaves it visible — we never
+// hide a real offer on an inconclusive check (rate limiting just hides fewer).
+async function verifyAccessibility(browser, products, { concurrency = 10, chunkSize = 200 } = {}) {
+  const targets = products.filter((p) => p.url);
+  if (!targets.length) return { checked: 0, dead: 0 };
+  const { ctx, page } = await newWorkerPage(browser);
+  let dead = 0;
+  try {
+    await page.setCookie({ name: 'salepoint', value: SALEPOINT, domain: '.carrefour.es', path: '/' });
+    // fetch() needs a same-origin document for the store cookies to apply.
+    await page.goto(`${ORIGIN}/supermercado`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+    for (let start = 0; start < targets.length; start += chunkSize) {
+      const slice = targets.slice(start, start + chunkSize);
+      const deadIdx = await page.evaluate(async (urls, conc) => {
+        const check = async (u) => {
+          const ac = new AbortController();
+          const timer = setTimeout(() => ac.abort(), 10_000);
+          try {
+            const r = await fetch(u, { method: 'HEAD', redirect: 'follow', signal: ac.signal });
+            if (r.status !== 200) return null;                              // inconclusive
+            return new URL(r.url).pathname.endsWith('/p') ? false : true;   // false=live, true=dead
+          } catch { return null; } finally { clearTimeout(timer); }
+        };
+        const hits = [];
+        let i = 0;
+        const worker = async () => {
+          while (i < urls.length) { const idx = i++; if ((await check(urls[idx])) === true) hits.push(idx); }
+        };
+        await Promise.all(Array.from({ length: Math.min(conc, urls.length) }, worker));
+        return hits;
+      }, slice.map((p) => p.url), concurrency);
+      for (const idx of deadIdx) { slice[idx].accessible = false; dead++; }
+      console.log(`  verified ${Math.min(start + chunkSize, targets.length)}/${targets.length} · ${dead} not in store`);
+    }
+  } finally {
+    await page.close().catch(() => {});
+    await ctx.close().catch(() => {});
+  }
+  return { checked: targets.length, dead };
+}
+
+// Drain a queue of campaign listing URLs across a pool of worker pages, feeding
+// every product to `ingest` and pushing each campaign's summary to `summaries`.
+// Each worker gets its own context (see newWorkerPage) so their product sets
+// don't overlap. Failures are recorded per-campaign, never abort the pool.
+async function scrapeCampaigns(browser, urls, ingest, summaries, workers, label = '') {
+  if (!urls.length) return;
+  const effectiveWorkers = Math.min(workers, urls.length);
+  const queue = urls.slice();
+  if (effectiveWorkers > 1) console.log(`\nStarting ${effectiveWorkers} parallel workers for ${urls.length} ${label}campaign(s)`);
+  const startedAt = Date.now();
+  await Promise.all(Array.from({ length: effectiveWorkers }, async (_, id) => {
+    const { ctx, page } = await newWorkerPage(browser);
+    // Stagger so all workers don't pound Cloudflare at the same instant.
+    await sleep(id * 1500);
+    try {
+      while (queue.length > 0) {
+        const u = queue.shift();
+        if (!u) break;
+        const tag = effectiveWorkers > 1 ? id + 1 : '';
+        try {
+          summaries.push(await scrapeListing(page, u, ingest, tag));
+        } catch (e) {
+          console.error(`${tag ? `[w${tag}] ` : ''}campaign ${u} failed: ${e.message}`);
+          summaries.push({ url: u, error: e.message });
+        }
+        await politeGap();
+      }
+    } finally {
+      await page.close().catch(() => {});
+      await ctx.close().catch(() => {});
+    }
+  }));
+  if (effectiveWorkers > 1) {
+    console.log(`Parallel ${label}scrape finished in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+  }
+}
+
+// The offers hub only lists the 7 category `/g` campaigns + 3x2, so headline
+// promos ("50% que vuelve", "super precio", "2ª unidad", "30%", …) are missed —
+// they live on `…/s` pages the hub never links. But every product carries a
+// promo badge that DOES link its campaign, so we harvest those `/s` URLs from
+// the products already scraped and walk the ones not yet covered. Skip `3x2`
+// (its `/g` campaign is comprehensive) and `envio-gratis` (a shipping perk, not
+// a discount). Same `/s` page structure as `/g`, so scrapeListing handles them.
+function discoverPromoCampaignsFromProducts(products, alreadyScraped = []) {
+  const done = new Set(alreadyScraped);
+  const skipSlugs = new Set(['3x2', 'envio-gratis']);
+  const found = new Set();
+  for (const p of products) {
+    const cu = p.promo?.campaignUrl;
+    if (!cu || !/\/s$/.test(cu) || done.has(cu) || found.has(cu)) continue;
+    let slug;
+    try { slug = new URL(cu).pathname.split('/')[2]; } catch { continue; }
+    if (skipSlugs.has(slug)) continue;
+    found.add(cu);
+  }
+  return [...found];
+}
+
+// Only run the scrape when invoked directly; when required as a module
+// (e.g. to regenerate the HTML from products.json) just expose the renderer.
+if (require.main === module) (async () => {
   const rawArgs = process.argv.slice(2);
   const force = rawArgs.includes('--force') || process.env.SCRAPE_FORCE === '1';
   const positional = rawArgs.filter((a) => !a.startsWith('--'));
@@ -501,41 +669,32 @@ async function newWorkerPage(browser) {
       }
     };
 
-    // One worker pool path — N=1 is a special case of the same code.
-    const effectiveWorkers = Math.min(workers, urls.length);
-    const queue = urls.slice();
+    // Pass 1 — the campaigns discovered on the offers hub (`/g`, single listing).
     const summaries = [];
-    if (effectiveWorkers > 1) console.log(`\nStarting ${effectiveWorkers} parallel workers for ${urls.length} campaigns`);
-    const startedAt = Date.now();
+    await scrapeCampaigns(browser, urls, ingest, summaries, workers);
 
-    await Promise.all(Array.from({ length: effectiveWorkers }, async (_, id) => {
-      const { ctx, page } = await newWorkerPage(browser);
-      // Stagger so all workers don't pound Cloudflare at the same instant.
-      await sleep(id * 1500);
-      try {
-        while (queue.length > 0) {
-          const u = queue.shift();
-          if (!u) break;
-          const tag = effectiveWorkers > 1 ? id + 1 : '';
-          try {
-            summaries.push(await scrapeListing(page, u, ingest, tag));
-          } catch (e) {
-            console.error(`${tag ? `[w${tag}] ` : ''}campaign ${u} failed: ${e.message}`);
-            summaries.push({ url: u, error: e.message });
-          }
-          await politeGap();
-        }
-      } finally {
-        await page.close().catch(() => {});
-        await ctx.close().catch(() => {});
+    // Pass 2 (hub mode) — headline promos reachable only via product badges
+    // (`…/s`): "50% que vuelve", "super precio", "2ª unidad", etc. Discover them
+    // from the products just scraped and walk the ones the hub didn't list.
+    if (isHub) {
+      const promoUrls = discoverPromoCampaignsFromProducts([...seen.values()], urls);
+      if (promoUrls.length) {
+        console.log(`\nDiscovered ${promoUrls.length} promo campaign(s) from product badges (…/s)`);
+        await scrapeCampaigns(browser, promoUrls, ingest, summaries, workers, 'promo ');
       }
-    }));
-    if (effectiveWorkers > 1) {
-      console.log(`\nParallel scrape finished in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
     }
 
     // Persist results
     const ordered = [...seen.values()];
+
+    // Grids list the national catalog; some products aren't in the target store
+    // and would open as dead links (redirect to their category). Flag those so
+    // the outputs drop them. products.json keeps every product (with the flag)
+    // as the raw record; the presentation/analysis outputs hide accessible:false.
+    console.log('\nVerifying product links against store…');
+    const verif = await verifyAccessibility(browser, ordered);
+    console.log(`✓ verified ${verif.checked} links · ${verif.dead} not available in store (hidden)`);
+
     const reportedTotal = summaries.reduce((s, c) => s + (c.total || 0), 0);
     const jsonPath = outPath('json');
     const csvPath = outPath('csv');
@@ -551,8 +710,11 @@ async function newWorkerPage(browser) {
       collected: ordered.length,
       products: ordered,
     };
+    // products.json = complete raw record (dead links flagged). CSV/HTML/AI are
+    // consumer outputs, so they drop the store-unavailable products.
+    const visible = ordered.filter((p) => p.accessible !== false);
     fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2));
-    fs.writeFileSync(csvPath, toCsv(ordered));
+    fs.writeFileSync(csvPath, toCsv(visible));
     const htmlInfo = renderHtml(payload, htmlPath);
 
     // AI-friendly artifacts: a compact, enriched, denormalized JSON for LLMs
@@ -565,6 +727,7 @@ async function newWorkerPage(browser) {
 
     console.log();
     console.log(`✓ collected ${ordered.length} unique products across ${summaries.length} campaign(s) (sum of campaign totals: ${reportedTotal})`);
+    console.log(`  ${visible.length} available in store · ${verif.dead} hidden (not in store / dead link)`);
     console.log(`✓ saved JSON   → ${jsonPath}`);
     console.log(`✓ saved CSV    → ${csvPath}`);
     console.log(`✓ saved HTML   → ${htmlPath} (${htmlInfo.total} products, ${htmlInfo.sizeKb} KB)`);
@@ -577,3 +740,5 @@ async function newWorkerPage(browser) {
   console.error('fatal:', e);
   process.exit(1);
 });
+
+module.exports = { renderHtml, verifyAccessibility };
