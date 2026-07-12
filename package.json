@@ -1,13 +1,7 @@
 {
   "name": "carrefour",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
+  "description": "Carrefour offers scraper — walks the promo campaigns and publishes a searchable HTML page plus JSON/CSV/AI artifacts",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
