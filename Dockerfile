@@ -2,6 +2,10 @@ FROM ghcr.io/puppeteer/puppeteer:latest
 ENV OUT_DIR=/output
 WORKDIR /app
 COPY package.json package-lock.json ./
+# The base image already bundles Chrome; without this, puppeteer's postinstall
+# downloads a second ~300 MB copy that nothing uses (PUPPETEER_EXECUTABLE_PATH
+# below pins the bundled one).
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 RUN npm ci
 COPY scrape.js analyze.js ./
 # The base image bundles Chrome under a version-stamped dir that bumps whenever

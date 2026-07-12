@@ -9,6 +9,8 @@
 //
 // Env:
 //   SCRAPE_WORKERS=N   concurrent campaign workers in hub mode (default 3)
+//   SCRAPE_FORCE=1     re-scrape even if today's result is already cached
+//   OUT_DIR=dir        where outputs (and the same-day cache) live (default cwd)
 //
 // Hub mode (URL ends in /c): discovers every /g campaign and scrapes them in
 // parallel. Single mode (/g): walks one listing.
@@ -18,10 +20,10 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const fs = require('fs');
 const path = require('path');
-const { buildAiPayload, renderReport, inferCategory } = require('./analyze');
+const { buildAiPayload, renderReport, inferCategory, isVisible, eur, stripAccents, kb } = require('./analyze');
 
-const DEFAULT_URL = 'https://www.carrefour.es/supermercado/ofertas/cat20968591/c';
 const ORIGIN = 'https://www.carrefour.es';
+const DEFAULT_URL = `${ORIGIN}/supermercado/ofertas/cat20968591/c`;
 const POSTAL_CODE = '28904';
 // The promo grids list Carrefour's NATIONAL catalog, but each shopper is pinned
 // to one store ("sale point") whose assortment is only a subset. A product in a
@@ -29,15 +31,33 @@ const POSTAL_CODE = '28904';
 // links" a shopper hits. We reproduce the target store during link verification
 // (see verifyAccessibility) with this cookie so we can drop what they can't open.
 // Format: <storeId>||<postal>|<deliveryMode>|<n>, copied from a live session's
-// `salepoint` cookie. Change it if the offers page should target another store.
-const SALEPOINT = '005704||28904|A_DOMICILIO|0';
+// `salepoint` cookie. Change STORE_ID if the offers should target another store.
+const STORE_ID = '005704';
+const SALEPOINT = `${STORE_ID}||${POSTAL_CODE}|A_DOMICILIO|0`;
+const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+// One product card in a listing grid — the selector every page-walk step keys on.
+const SEL_CARD = '.product-card-list__item';
 const PAGE_SIZE = 24;
+// Assumed page count when a listing shows no total (observed grids cap at ~40
+// pages; the walk stops early anyway on the first empty page).
+const FALLBACK_MAX_PAGES = 27;
 const NAV_TIMEOUT_MS = 90_000;
+const SELECTOR_TIMEOUT_MS = 30_000;
+const HEAD_TIMEOUT_MS = 10_000;
 const RETRIES_PER_PAGE = 3;
 const POLITE_DELAY_MS = 800;
 const POLITE_JITTER_MS = 600;
 const RATE_LIMIT_BACKOFF_MS = 15_000;
+const WORKER_STAGGER_MS = 1500;
 const DEFAULT_WORKERS = 3;
+const VERIFY_CONCURRENCY = 10;
+const VERIFY_CHUNK = 200;
+// Category label for products inferCategory can't classify (HTML grouping).
+const OTHER_CATEGORY = 'Otros';
+// Env knobs (documented in the header).
+const ENV_WORKERS = parseInt(process.env.SCRAPE_WORKERS, 10);
+const ENV_FORCE = process.env.SCRAPE_FORCE === '1';
+const OUT_DIR = process.env.OUT_DIR || process.cwd();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const politeGap = () => sleep(POLITE_DELAY_MS + Math.floor(Math.random() * POLITE_JITTER_MS));
@@ -48,6 +68,10 @@ const awaitCoolDown = () => sleep(Math.max(0, coolDownUntil - Date.now()));
 const tripCoolDown = (ms = RATE_LIMIT_BACKOFF_MS) => {
   coolDownUntil = Math.max(coolDownUntil, Date.now() + ms);
 };
+
+// Carrefour listing URLs end in a kind marker: /c hub-category, /g campaign,
+// /s promo campaign. One tolerant tail test so the checks can't drift apart.
+const isListingKind = (url, kind) => new RegExp(`/${kind}(?:[?#].*)?$`).test(url);
 
 function buildPageUrl(baseUrl, offset) {
   const u = new URL(baseUrl);
@@ -71,20 +95,20 @@ async function autoScroll(page) {
 }
 
 async function readPageMeta(page) {
-  return page.evaluate(() => {
+  return page.evaluate((selCard) => {
     const spans = document.querySelectorAll('.pagination__results-item');
     return {
-      cardCount: document.querySelectorAll('.product-card-list__item').length,
+      cardCount: document.querySelectorAll(selCard).length,
       // "1 - 24 de 640 productos" → last span holds the total
       total: spans.length >= 3
         ? parseInt(spans[spans.length - 1].innerText.replace(/\D/g, ''), 10)
         : null,
     };
-  });
+  }, SEL_CARD);
 }
 
 async function extractProducts(page) {
-  return page.evaluate((origin) => {
+  return page.evaluate((origin, selCard) => {
     const absolutize = (h) => {
       if (!h) return null;
       try { return new URL(h, origin).toString(); } catch { return h; }
@@ -101,7 +125,7 @@ async function extractProducts(page) {
       ?? h?.match(/\/(\d{4,})\/p\b/)?.[1]
       ?? null;
 
-    return Array.from(document.querySelectorAll('.product-card-list__item')).map((li, idx) => {
+    return Array.from(document.querySelectorAll(selCard)).map((li, idx) => {
       const parent = li.querySelector('.product-card__parent');
       const titleA = li.querySelector('.product-card__title a, h2 a');
       const mediaA = li.querySelector('.product-card__media-link');
@@ -144,7 +168,7 @@ async function extractProducts(page) {
         } : null,
       };
     });
-  }, ORIGIN);
+  }, ORIGIN, SEL_CARD);
 }
 
 async function loadPage(page, url) {
@@ -161,7 +185,7 @@ async function loadPage(page, url) {
         throw new Error(`HTTP ${status}`);
       }
       if (!status || status >= 400) throw new Error(`HTTP ${status}`);
-      await page.waitForSelector('.product-card-list__item', { timeout: 30_000 });
+      await page.waitForSelector(SEL_CARD, { timeout: SELECTOR_TIMEOUT_MS });
       await autoScroll(page);
       await sleep(300 + Math.floor(Math.random() * 400));
       return;
@@ -176,14 +200,12 @@ async function loadPage(page, url) {
 const escapeHtml = (s) => s == null ? '' : String(s).replace(/[&<>"]/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-const fmtPrice = (v) => v == null ? '' : `${v.toFixed(2)} €`.replace('.', ',');
-
 // Self-contained, searchable HTML page. Products are inlined as JSON so
 // filtering/sorting runs entirely in the browser — works offline.
 function renderHtml(payload, outPath) {
   const all = payload.products || [];
   // Skip products explicitly marked inaccessible (untouched products are kept).
-  const products = all.filter((p) => p.accessible !== false);
+  const products = all.filter(isVisible);
   const hiddenCount = all.length - products.length;
   const brands = new Set(products.map((p) => p.brand).filter(Boolean));
   const prices = products.map((p) => p.price).filter((v) => v != null);
@@ -196,7 +218,7 @@ function renderHtml(payload, outPath) {
   }).format(new Date(payload.scrapedAt));
   // Tag each product with an inferred type so the page can group by category
   // (the same heuristic the AI report uses); uncategorized → "Otros".
-  const tagged = products.map((p) => ({ ...p, category: inferCategory(p.name) || 'Otros' }));
+  const tagged = products.map((p) => ({ ...p, category: inferCategory(p.name) || OTHER_CATEGORY }));
   // Escape `<` so a stray `</script>` in product names can't close the tag.
   const dataJson = JSON.stringify(tagged).replace(/</g, '\\u003c');
 
@@ -248,7 +270,7 @@ function renderHtml(payload, outPath) {
 <body>
 <header>
   <h1>Carrefour · ofertas</h1>
-  <span class="meta">${products.length} productos · ${brands.size} marcas · ${fmtPrice(priceMin)} – ${fmtPrice(priceMax)}${hiddenNote} · <span title="${escapeHtml(payload.scrapedAt)}">Actualizado ${escapeHtml(updatedAt)}</span></span>
+  <span class="meta">${products.length} productos · ${brands.size} marcas · ${eur(priceMin)} – ${eur(priceMax)}${hiddenNote} · <span title="${escapeHtml(payload.scrapedAt)}">Actualizado ${escapeHtml(updatedAt)}</span></span>
   <div class="controls">
     <input id="q" type="search" placeholder="Buscar producto, marca…" autocomplete="off">
     <select id="brand"><option value="">Todas las marcas</option></select>
@@ -291,15 +313,17 @@ function renderHtml(payload, outPath) {
   }
 
   const fmt = (v) => v == null ? '' : v.toFixed(2).replace('.', ',') + ' €';
-  const norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+  // Same normalizer the scraper uses for category tagging (interpolated at
+  // render time so client search can't drift from it).
+  const norm = ${stripAccents.toString()};
+  const OTROS = ${JSON.stringify(OTHER_CATEGORY)};
 
   function renderCard(p) {
     const promoTitle = p.promo?.title;
-    const promoColor = p.promo?.color || '#A63793';
     return \`<a class="card" href="\${p.url || '#'}" target="_blank" rel="noopener">
       <div class="imgwrap">
         \${p.imageUrl ? \`<img loading="lazy" src="\${p.imageUrl}" alt="">\` : ''}
-        \${promoTitle ? \`<span class="badge" style="background:\${promoColor}">\${promoTitle}</span>\` : ''}
+        \${promoTitle ? \`<span class="badge"\${p.promo?.color ? \` style="background:\${p.promo.color}"\` : ''}>\${promoTitle}</span>\` : ''}
       </div>
       <div class="body">
         <div class="brand">\${p.brand || ''}</div>
@@ -329,12 +353,12 @@ function renderHtml(payload, outPath) {
       grid.className = '';
       const groups = new Map();
       for (const p of rows) {
-        const k = p.category || 'Otros';
+        const k = p.category || OTROS;
         if (!groups.has(k)) groups.set(k, []);
         groups.get(k).push(p);
       }
       const names = [...groups.keys()].sort((a, b) =>
-        a === 'Otros' ? 1 : b === 'Otros' ? -1 : a.localeCompare(b, 'es'));
+        a === OTROS ? 1 : b === OTROS ? -1 : a.localeCompare(b, 'es'));
       grid.innerHTML = names.map((name) => {
         const items = groups.get(name);
         const col = collapsed.has(name);
@@ -369,7 +393,6 @@ function renderHtml(payload, outPath) {
 </script>
 </body>
 </html>`);
-  return { total: products.length, sizeKb: Math.round(fs.statSync(outPath).size / 1024) };
 }
 
 function toCsv(rows) {
@@ -410,7 +433,7 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
   await loadPage(page, buildPageUrl(baseUrl, 0));
   const meta = await readPageMeta(page);
   const pageSize = meta.cardCount || PAGE_SIZE;
-  const total = meta.total || (meta.cardCount * 27);
+  const total = meta.total || (meta.cardCount * FALLBACK_MAX_PAGES);
   const totalPages = Math.ceil(total / pageSize);
   console.log(`${tag}  ${campaign}: ${total} products / ${totalPages} pages`);
 
@@ -428,7 +451,7 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
         console.log(`${tag}  ${campaign}: empty page ${pageNumber} — stopping`);
         break;
       }
-      await politeGap();
+      if (pageNumber < totalPages) await politeGap();
     } catch (e) {
       console.error(`${tag}  ${campaign} page ${pageNumber} failed: ${e.message}`);
     }
@@ -467,7 +490,7 @@ async function discoverCampaignUrls(page, hubUrl) {
 async function newWorkerPage(browser) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36');
+  await page.setUserAgent(USER_AGENT);
   await page.setViewport({ width: 1366, height: 900 });
   await page.setRequestInterception(true);
   page.on('request', (req) => {
@@ -479,7 +502,11 @@ async function newWorkerPage(browser) {
     { name: 'postalCode',     value: POSTAL_CODE, domain: '.carrefour.es', path: '/' },
     { name: 'userPostalCode', value: POSTAL_CODE, domain: '.carrefour.es', path: '/' },
   );
-  return { ctx, page };
+  const close = async () => {
+    await page.close().catch(() => {});
+    await ctx.close().catch(() => {});
+  };
+  return { ctx, page, close };
 }
 
 // Carrefour's promo grids list the national catalog, but each shopper is pinned
@@ -491,25 +518,25 @@ async function newWorkerPage(browser) {
 // drop them (they already filter on that flag). Only a definitive 200-not-on-/p
 // hides a product; a non-200 or a network error leaves it visible — we never
 // hide a real offer on an inconclusive check (rate limiting just hides fewer).
-async function verifyAccessibility(browser, products, { concurrency = 10, chunkSize = 200 } = {}) {
+async function verifyAccessibility(browser, products) {
   const targets = products.filter((p) => p.url);
   if (!targets.length) return { checked: 0, dead: 0 };
-  const { ctx, page } = await newWorkerPage(browser);
+  const { page, close } = await newWorkerPage(browser);
   let dead = 0;
   try {
     await page.setCookie({ name: 'salepoint', value: SALEPOINT, domain: '.carrefour.es', path: '/' });
     // fetch() needs a same-origin document for the store cookies to apply.
     await page.goto(`${ORIGIN}/supermercado`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-    for (let start = 0; start < targets.length; start += chunkSize) {
-      const slice = targets.slice(start, start + chunkSize);
-      const deadIdx = await page.evaluate(async (urls, conc) => {
+    for (let start = 0; start < targets.length; start += VERIFY_CHUNK) {
+      const slice = targets.slice(start, start + VERIFY_CHUNK);
+      const deadIdx = await page.evaluate(async (urls, conc, timeoutMs) => {
         const check = async (u) => {
           const ac = new AbortController();
-          const timer = setTimeout(() => ac.abort(), 10_000);
+          const timer = setTimeout(() => ac.abort(), timeoutMs);
           try {
             const r = await fetch(u, { method: 'HEAD', redirect: 'follow', signal: ac.signal });
-            if (r.status !== 200) return null;                              // inconclusive
-            return new URL(r.url).pathname.endsWith('/p') ? false : true;   // false=live, true=dead
+            if (r.status !== 200) return null; // inconclusive
+            return !new URL(r.url).pathname.endsWith('/p'); // dead unless it lands on a product URL
           } catch { return null; } finally { clearTimeout(timer); }
         };
         const hits = [];
@@ -519,13 +546,12 @@ async function verifyAccessibility(browser, products, { concurrency = 10, chunkS
         };
         await Promise.all(Array.from({ length: Math.min(conc, urls.length) }, worker));
         return hits;
-      }, slice.map((p) => p.url), concurrency);
+      }, slice.map((p) => p.url), VERIFY_CONCURRENCY, HEAD_TIMEOUT_MS);
       for (const idx of deadIdx) { slice[idx].accessible = false; dead++; }
-      console.log(`  verified ${Math.min(start + chunkSize, targets.length)}/${targets.length} · ${dead} not in store`);
+      console.log(`  verified ${Math.min(start + VERIFY_CHUNK, targets.length)}/${targets.length} · ${dead} not in store`);
     }
   } finally {
-    await page.close().catch(() => {});
-    await ctx.close().catch(() => {});
+    await close();
   }
   return { checked: targets.length, dead };
 }
@@ -541,13 +567,12 @@ async function scrapeCampaigns(browser, urls, ingest, summaries, workers, label 
   if (effectiveWorkers > 1) console.log(`\nStarting ${effectiveWorkers} parallel workers for ${urls.length} ${label}campaign(s)`);
   const startedAt = Date.now();
   await Promise.all(Array.from({ length: effectiveWorkers }, async (_, id) => {
-    const { ctx, page } = await newWorkerPage(browser);
+    const { page, close } = await newWorkerPage(browser);
     // Stagger so all workers don't pound Cloudflare at the same instant.
-    await sleep(id * 1500);
+    await sleep(id * WORKER_STAGGER_MS);
     try {
-      while (queue.length > 0) {
-        const u = queue.shift();
-        if (!u) break;
+      let u;
+      while ((u = queue.shift())) {
         const tag = effectiveWorkers > 1 ? id + 1 : '';
         try {
           summaries.push(await scrapeListing(page, u, ingest, tag));
@@ -555,11 +580,10 @@ async function scrapeCampaigns(browser, urls, ingest, summaries, workers, label 
           console.error(`${tag ? `[w${tag}] ` : ''}campaign ${u} failed: ${e.message}`);
           summaries.push({ url: u, error: e.message });
         }
-        await politeGap();
+        if (queue.length) await politeGap();
       }
     } finally {
-      await page.close().catch(() => {});
-      await ctx.close().catch(() => {});
+      await close();
     }
   }));
   if (effectiveWorkers > 1) {
@@ -580,7 +604,7 @@ function discoverPromoCampaignsFromProducts(products, alreadyScraped = []) {
   const found = new Set();
   for (const p of products) {
     const cu = p.promo?.campaignUrl;
-    if (!cu || !/\/s$/.test(cu) || done.has(cu) || found.has(cu)) continue;
+    if (!cu || !isListingKind(cu, 's') || done.has(cu) || found.has(cu)) continue;
     let slug;
     try { slug = new URL(cu).pathname.split('/')[2]; } catch { continue; }
     if (skipSlugs.has(slug)) continue;
@@ -593,14 +617,13 @@ function discoverPromoCampaignsFromProducts(products, alreadyScraped = []) {
 // (e.g. to regenerate the HTML from products.json) just expose the renderer.
 if (require.main === module) (async () => {
   const rawArgs = process.argv.slice(2);
-  const force = rawArgs.includes('--force') || process.env.SCRAPE_FORCE === '1';
+  const force = rawArgs.includes('--force') || ENV_FORCE;
   const positional = rawArgs.filter((a) => !a.startsWith('--'));
   const baseUrl = positional[0] || DEFAULT_URL;
   const outBase = positional[1] || 'products';
   // Outputs — and the same-day cache — live in OUT_DIR: the mounted volume in
   // Docker (Dockerfile sets ENV OUT_DIR=/output), or cwd for a direct run.
-  const outDir = process.env.OUT_DIR || process.cwd();
-  const outPath = (ext) => path.resolve(outDir, `${outBase}.${ext}`);
+  const outPath = (ext) => path.resolve(OUT_DIR, `${outBase}.${ext}`);
 
   // The offers don't change within a day, so a second run today is wasted work
   // (and risks rate limits). If we already have today's scrape, reuse it as the
@@ -619,16 +642,15 @@ if (require.main === module) (async () => {
     } catch { /* unreadable / pre-cache file — fall through and scrape */ }
   }
 
-  const isHub = /\/c(?:[?#].*)?$/.test(baseUrl);
-  const requestedWorkers = parseInt(process.env.SCRAPE_WORKERS, 10);
+  const isHub = isListingKind(baseUrl, 'c');
   const workers = isHub
-    ? Math.max(1, Number.isFinite(requestedWorkers) ? requestedWorkers : DEFAULT_WORKERS)
+    ? Math.max(1, Number.isFinite(ENV_WORKERS) ? ENV_WORKERS : DEFAULT_WORKERS)
     : 1;
 
   console.log('Carrefour scraper');
   console.log('  base URL:', baseUrl);
   console.log('  mode:    ', isHub ? `hub (walk every /g campaign, ${workers} workers)` : 'single listing');
-  console.log('  out:     ', `${outDir}/${outBase}.{json,csv,html,ai.json,report.md}`);
+  console.log('  out:     ', `${OUT_DIR}/${outBase}.{json,csv,html,ai.json,report.md}`);
   console.log();
 
   const browser = await puppeteer.launch({
@@ -640,13 +662,12 @@ if (require.main === module) (async () => {
     // Discover campaign URLs (hub mode) using a throwaway worker page.
     let urls = [baseUrl];
     if (isHub) {
-      const { ctx, page } = await newWorkerPage(browser);
+      const { page, close } = await newWorkerPage(browser);
       try {
         urls = await discoverCampaignUrls(page, baseUrl);
         if (urls.length === 0) throw new Error('No /g campaign URLs found on hub — is this really a hub page?');
       } finally {
-        await page.close().catch(() => {});
-        await ctx.close().catch(() => {});
+        await close();
       }
     }
 
@@ -712,10 +733,10 @@ if (require.main === module) (async () => {
     };
     // products.json = complete raw record (dead links flagged). CSV/HTML/AI are
     // consumer outputs, so they drop the store-unavailable products.
-    const visible = ordered.filter((p) => p.accessible !== false);
-    fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2));
+    const visible = ordered.filter(isVisible);
+    fs.writeFileSync(jsonPath, JSON.stringify(payload));
     fs.writeFileSync(csvPath, toCsv(visible));
-    const htmlInfo = renderHtml(payload, htmlPath);
+    renderHtml(payload, htmlPath);
 
     // AI-friendly artifacts: a compact, enriched, denormalized JSON for LLMs
     // and a deterministic Markdown digest. Built from a shallow copy carrying
@@ -723,14 +744,13 @@ if (require.main === module) (async () => {
     const ai = buildAiPayload({ ...payload, postalCode: POSTAL_CODE });
     fs.writeFileSync(aiPath, JSON.stringify(ai));
     fs.writeFileSync(reportPath, renderReport(ai));
-    const kb = (p) => Math.round(fs.statSync(p).size / 1024);
 
     console.log();
     console.log(`✓ collected ${ordered.length} unique products across ${summaries.length} campaign(s) (sum of campaign totals: ${reportedTotal})`);
     console.log(`  ${visible.length} available in store · ${verif.dead} hidden (not in store / dead link)`);
     console.log(`✓ saved JSON   → ${jsonPath}`);
     console.log(`✓ saved CSV    → ${csvPath}`);
-    console.log(`✓ saved HTML   → ${htmlPath} (${htmlInfo.total} products, ${htmlInfo.sizeKb} KB)`);
+    console.log(`✓ saved HTML   → ${htmlPath} (${visible.length} products, ${kb(htmlPath)} KB)`);
     console.log(`✓ saved AI     → ${aiPath} (${ai.products.length} products, ${ai.promos.length} promos, ${kb(aiPath)} KB)`);
     console.log(`✓ saved report → ${reportPath} (${kb(reportPath)} KB)`);
   } finally {
@@ -741,4 +761,4 @@ if (require.main === module) (async () => {
   process.exit(1);
 });
 
-module.exports = { renderHtml, verifyAccessibility };
+module.exports = { renderHtml };

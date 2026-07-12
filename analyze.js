@@ -18,7 +18,20 @@
 // coupons ("que vuelve" / "en Cupón") are deferred (returned on a later
 // purchase), flagged with deferred:true. See PROMO_RULES.
 
+const fs = require('fs');
+
 const SCHEMA = 'carrefour-ai/1';
+
+// Comparable units Carrefour prices by (€/kg, €/l, …) — drives both the LLM
+// notes and the per-unit report sections.
+const UNITS = ['kg', 'l', 'ud', 'lavado', 'm'];
+
+// Single source of the "hidden product" rule: products flagged accessible:false
+// by the scraper's store check are dropped from every consumer output
+// (HTML, CSV, AI payload); products never checked stay visible.
+const isVisible = (p) => p.accessible !== false;
+
+const kb = (p) => Math.round(fs.statSync(p).size / 1024);
 
 // ---------------------------------------------------------------------------
 // Promo classification. Carrefour shows ~13 distinct badge titles; each maps to
@@ -27,11 +40,10 @@ const SCHEMA = 'carrefour-ai/1';
 // pair). Cashback coupons are marked deferred — the value comes back later, so
 // it is NOT an immediate price cut. Titles not in the table fall through to the
 // regex heuristics in classifyPromo(), so future badges still classify.
+// "2ª unidad -N%" and "NxM" badges are NOT tabled: the heuristics below compute
+// them for any percentage/ratio, so tabling common variants would only create a
+// second copy of the same math.
 const PROMO_RULES = {
-  '2ª unidad -50%':   { type: 'second-unit',     effPct: 25, basis: 'al comprar 2 uds' },
-  '2ª unidad -70%':   { type: 'second-unit',     effPct: 35, basis: 'al comprar 2 uds' },
-  '3x2':              { type: 'multibuy',        effPct: 33, basis: 'al comprar 3 uds' },
-  '2x1':              { type: 'multibuy',        effPct: 50, basis: 'al comprar 2 uds' },
   '50% que vuelve':   { type: 'cashback-coupon', effPct: 50, basis: 'cupón próxima compra', deferred: true },
   '50% en Cupón':     { type: 'cashback-coupon', effPct: 50, basis: 'cupón', deferred: true },
   '20% en Cupón':     { type: 'cashback-coupon', effPct: 20, basis: 'cupón', deferred: true },
@@ -79,12 +91,12 @@ const CATEGORY_RULES = [
   // formula ("leche infantil") contain food words that would otherwise land them
   // in Carne/Lácteos and dodge a category filter for those who don't buy them.
   ['Mascotas',           ['pienso', 'para perro', 'para perros', 'para gato', 'para gatos', ' perros', ' gatos', 'mascota', 'felix', 'whiskas', 'friskies', 'pedigree', 'purina', 'dentastix']],
-  ['Bebé',               ['infantil', 'papilla', 'potito', 'pañal', 'panal', 'toallitas bebe', 'bebe ', 'blemil', 'almiron', 'nan optipro', 'nutriben', 'blevit', 'puleva peques']],
+  ['Bebé',               ['infantil', 'papilla', 'potito', 'pañal', 'toallitas bebe', 'bebe ', 'blemil', 'almiron', 'nan optipro', 'nutriben', 'blevit', 'puleva peques']],
   ['Charcutería',        ['jamon', 'chorizo', 'salchichon', 'fuet', 'embuchado', 'mortadela', 'salami', 'embutido', 'fiambre', 'pate', 'sobrasada', 'cecina', 'lacon', 'chopped']],
   ['Lácteos y huevos',   ['leche', 'yogur', 'queso', 'mantequilla', 'margarina', ' nata', 'kefir', 'cuajada', 'natillas', 'mascarpone', 'requeson', 'huevo', 'flan']],
   ['Pescado y marisco',  ['atun', 'merluza', 'salmon', 'bacalao', 'gamba', 'langostino', 'marisco', 'sardina', 'anchoa', 'mejillon', 'pulpo', 'calamar', 'surimi', 'palitos de mar', 'pescado', 'boqueron', 'rape', 'dorada', 'lubina']],
   ['Carne y aves',       ['pollo', 'cerdo', 'ternera', 'vacuno', 'lomo', 'chuleta', 'salchicha', 'hamburguesa', 'bacon', 'panceta', 'pavo', 'cordero', 'costilla', 'solomillo', 'carne', 'magro', 'butifarra']],
-  ['Frutas y verduras',  ['manzana', 'platano', 'naranja', 'tomate', 'lechuga', 'patata', 'cebolla', 'zanahoria', 'pimiento', 'fresa', 'verdura', 'ensalada', 'pepino', 'calabac', 'brocoli', 'champiñon', 'champinon', 'aguacate', 'mandarina', 'limon', 'pera ', 'uva', 'sandia', 'melon', 'kiwi', 'fruta']],
+  ['Frutas y verduras',  ['manzana', 'platano', 'naranja', 'tomate', 'lechuga', 'patata', 'cebolla', 'zanahoria', 'pimiento', 'fresa', 'verdura', 'ensalada', 'pepino', 'calabac', 'brocoli', 'champiñon', 'aguacate', 'mandarina', 'limon', 'pera ', 'uva', 'sandia', 'melon', 'kiwi', 'fruta']],
   ['Congelados',         ['congelad', 'helado', 'varitas', 'nuggets', 'croqueta']],
   ['Panadería y bollería', ['pan ', 'pan d', 'bolleria', 'croissant', 'magdalena', 'galleta', 'bizcocho', 'tostada', 'donut', 'napolitana', 'palmera', 'gofre', 'reposteria', 'masa']],
   ['Cereales y dulces',  ['cereal', 'mermelada', ' miel', 'cacao', 'colacao', 'nesquik', 'chocolate', 'bombon', 'turron', 'caramelo', 'chicle', 'gominola', 'golosina']],
@@ -98,15 +110,20 @@ const CATEGORY_RULES = [
   ['Bebidas',            ['agua', 'refresco', 'cola', 'cerveza', 'vino', 'zumo', 'tonica', 'bitter', 'sidra', 'vermut', 'ginebra', ' ron ', 'whisky', 'vodka', 'licor', 'cava', 'champan', 'mosto', 'isotonic', 'energetica', 'monster', 'aquarius', 'nestea', 'bebida']],
   ['Cuidado personal',   ['gel de', 'champu', 'desodorante', 'colonia', 'crema', 'dentifrico', 'pasta de dientes', 'cepillo', 'maquillaje', 'compresa', 'tampon', 'papel higienico', 'jabon', 'cuchilla', 'afeitar', 'higiene', 'corporal', 'facial']],
   ['Limpieza y hogar',   ['detergente', 'suavizante', 'lejia', 'limpiador', 'friegasuelos', 'lavavajillas', 'bayeta', 'estropajo', 'servilleta', 'bolsa de basura', 'papel de cocina', 'ambientador', 'insecticida', 'fregasuelos', 'limpia']],
-  ['Platos preparados',  ['pizza', 'preparado', 'precocinad', 'lasaña', 'lasana']],
+  ['Platos preparados',  ['pizza', 'preparado', 'precocinad', 'lasaña']],
 ];
 
 const stripAccents = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
 
+// Keywords normalized once at load — inferCategory runs per product (twice: AI
+// payload + HTML tagging), so normalizing the constant rules inside the loop
+// would redo ~300 string normalizations per call.
+const NORM_RULES = CATEGORY_RULES.map(([cat, kws]) => [cat, kws.map(stripAccents)]);
+
 function inferCategory(name) {
   const n = ' ' + stripAccents(name) + ' ';
-  for (const [cat, kws] of CATEGORY_RULES) {
-    for (const kw of kws) if (n.includes(stripAccents(kw))) return cat;
+  for (const [cat, kws] of NORM_RULES) {
+    for (const kw of kws) if (n.includes(kw)) return cat;
   }
   return null;
 }
@@ -152,7 +169,7 @@ const median = (xs) => {
 // ---------------------------------------------------------------------------
 // buildAiPayload: compact, denormalized, enriched view of the raw payload.
 function buildAiPayload(payload) {
-  const raw = (payload.products || []).filter((p) => p.accessible !== false && (p.name || p.url));
+  const raw = (payload.products || []).filter((p) => isVisible(p) && (p.name || p.url));
 
   // Dedupe promos into a lookup table keyed by title (titles are stable and
   // carry all the semantics we surface). Products reference a promo by index.
@@ -259,11 +276,11 @@ function buildAiPayload(payload) {
     scrapedAt: payload.scrapedAt,
     sourceUrl: payload.sourceUrl,
     currency: 'EUR',
-    postalCode: payload.postalCode || '28904',
+    postalCode: payload.postalCode ?? null,
     notes: [
       'effectiveDiscountPct in promos[] is an estimate of the immediate discount when the offer basis is met (e.g. buying 2 units).',
       'Promos with deferred:true (cashback "que vuelve" / "en Cupón") return value on a later purchase — not an immediate price cut.',
-      'unitPrice is Carrefour\'s €/unit (unit field: kg, l, ud, lavado, m) — use it to compare value across pack sizes.',
+      `unitPrice is Carrefour's €/unit (unit field: ${UNITS.join(', ')}) — use it to compare value across pack sizes.`,
       'discountPct is an immediate price cut, present only when a strikethrough original price was shown.',
       'category is inferred from the product name (heuristic); uncategorized products have no category field.',
     ],
@@ -290,7 +307,7 @@ function renderReport(ai) {
   const L = [];
   L.push(`# Carrefour — Análisis de ofertas`);
   L.push('');
-  L.push(`_Fuente: ${ai.sourceUrl} · capturado ${ai.scrapedAt} · CP ${ai.postalCode}_`);
+  L.push(`_Fuente: ${ai.sourceUrl} · capturado ${ai.scrapedAt} · CP ${ai.postalCode ?? '—'}_`);
   L.push('');
 
   L.push(`## Resumen`);
@@ -332,13 +349,12 @@ function renderReport(ai) {
   L.push('');
   L.push(`_Comparativa de valor por unidad de medida (incluye productos básicos como sal, azúcar o harina)._`);
   L.push('');
-  const unitLabel = { kg: '€/kg', l: '€/l', ud: '€/ud', lavado: '€/lavado', m: '€/m' };
-  for (const u of ['kg', 'l', 'ud', 'lavado', 'm']) {
+  for (const u of UNITS) {
     const arr = s.cheapestPerUnit[u];
     if (!arr?.length) continue;
-    L.push(`### ${unitLabel[u] || u} (${u})`);
+    L.push(`### €/${u} (${u})`);
     L.push('');
-    L.push(`| Producto | Marca | ${unitLabel[u] || u} | Precio |`);
+    L.push(`| Producto | Marca | €/${u} | Precio |`);
     L.push(`| --- | --- | ---: | ---: |`);
     for (const p of arr) {
       L.push(`| ${mdEsc(p.name)} | ${mdEsc(p.brand || '')} | ${p.unitPrice.toFixed(2).replace('.', ',')} | ${eur(p.price)} |`);
@@ -371,11 +387,10 @@ function renderReport(ai) {
   return L.join('\n');
 }
 
-module.exports = { buildAiPayload, renderReport, classifyPromo, inferCategory, SCHEMA };
+module.exports = { buildAiPayload, renderReport, inferCategory, isVisible, eur, stripAccents, kb };
 
 // CLI: backfill/regenerate from an existing scrape without re-scraping.
 if (require.main === module) {
-  const fs = require('fs');
   const path = require('path');
   const inPath = process.argv[2] || 'products.json';
   const outBase = process.argv[3] || inPath.replace(/\.json$/, '');
@@ -385,7 +400,6 @@ if (require.main === module) {
   const mdPath = path.resolve(`${outBase}.report.md`);
   fs.writeFileSync(aiPath, JSON.stringify(ai));
   fs.writeFileSync(mdPath, renderReport(ai));
-  const kb = (p) => Math.round(fs.statSync(p).size / 1024);
   console.log(`✓ ${ai.products.length} products, ${ai.promos.length} promos, ${ai.summary.categoryCount} categories`);
   console.log(`✓ AI JSON  → ${aiPath} (${kb(aiPath)} KB)`);
   console.log(`✓ report   → ${mdPath} (${kb(mdPath)} KB)`);
