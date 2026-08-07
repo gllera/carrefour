@@ -97,12 +97,18 @@ async function autoScroll(page) {
 async function readPageMeta(page) {
   return page.evaluate((selCard) => {
     const spans = document.querySelectorAll('.pagination__results-item');
+    const num = (el) => parseInt((el?.innerText || '').replace(/\D/g, ''), 10);
+    // "1 - 24 de 640 productos" → [from, to, total]
+    const from = spans.length >= 3 ? num(spans[0]) : null;
+    const to = spans.length >= 3 ? num(spans[1]) : null;
     return {
       cardCount: document.querySelectorAll(selCard).length,
-      // "1 - 24 de 640 productos" → last span holds the total
-      total: spans.length >= 3
-        ? parseInt(spans[spans.length - 1].innerText.replace(/\D/g, ''), 10)
-        : null,
+      total: spans.length >= 3 ? num(spans[spans.length - 1]) : null,
+      // The listing's real page window, which the card count is NOT a stand-in
+      // for: promo category pages inject sponsored slots (30 cards over a
+      // 24-wide window), and paging by that inflated size steps clean over the
+      // products in between — a silent ~20% loss.
+      pageSize: from && to && to >= from ? to - from + 1 : null,
     };
   }, SEL_CARD);
 }
@@ -432,7 +438,7 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
   console.log(`\n${tag}=== ${campaign}`);
   await loadPage(page, buildPageUrl(baseUrl, 0));
   const meta = await readPageMeta(page);
-  const pageSize = meta.cardCount || PAGE_SIZE;
+  const pageSize = meta.pageSize || meta.cardCount || PAGE_SIZE;
   const total = meta.total || (meta.cardCount * FALLBACK_MAX_PAGES);
   const totalPages = Math.ceil(total / pageSize);
   console.log(`${tag}  ${campaign}: ${total} products / ${totalPages} pages`);
@@ -460,7 +466,28 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
   return { url: baseUrl, total, collected };
 }
 
-// From a hub `/c` page, collect every campaign-style listing link (`/g` URLs).
+// Split a promo *category* URL (`…/<algo>-promocion/F-…/c`) into its category
+// segments, or null if it isn't one. `/supermercado/la-despensa-promocion/F-x/c`
+// → ['la-despensa-promocion']; the nested form keeps its parent:
+// `/supermercado/limpieza-y-hogar/cuidado-de-la-ropa-promocion/F-x/c`
+// → ['limpieza-y-hogar', 'cuidado-de-la-ropa-promocion'].
+function promoCategorySegments(url) {
+  let parts;
+  try { parts = new URL(url).pathname.split('/').filter(Boolean); } catch { return null; }
+  if (parts[0] !== 'supermercado') return null;
+  const segs = parts.slice(1, -2); // drop the trailing `F-…` id and `/c` marker
+  if (!segs.length || !segs[segs.length - 1].endsWith('-promocion')) return null;
+  return segs;
+}
+
+// From a hub `/c` page, collect the two kinds of listing the offers live in:
+//   • `/g` campaign pages — the fortnightly waves ("aceite1q26agosto", …)
+//   • `…-promocion/F-…/c` category pages — the standing discount catalog
+// The hub links both, but only the `/g` set was ever walked. That set empties
+// out between campaign waves (2026-08-07: 4 campaigns → 158 products, while the
+// promo categories held 2000+), so relying on it alone makes the whole scrape
+// collapse for days at a time. Plain category links (`…/cat20002/c`) are the
+// FULL catalog rather than offers, so only `-promocion` slugs qualify.
 async function discoverCampaignUrls(page, hubUrl) {
   console.log(`Discovering campaigns from ${hubUrl}`);
   await page.goto(hubUrl, { waitUntil: 'networkidle2', timeout: NAV_TIMEOUT_MS });
@@ -473,14 +500,30 @@ async function discoverCampaignUrls(page, hubUrl) {
       let url;
       try { url = new URL(a.getAttribute('href') || '', origin).toString(); } catch { continue; }
       if (!url.startsWith(origin + '/supermercado/')) continue;
-      if (!/\/[^/]+\/[^/?#]+\/g(?:[?#].*)?$/.test(url)) continue;
       seen.add(url);
     }
     return [...seen];
   }, ORIGIN);
-  console.log(`  found ${links.length} campaign URLs`);
-  for (const u of links) console.log('    ' + u);
-  return links;
+
+  const campaigns = links.filter((u) => /\/[^/]+\/[^/?#]+\/g(?:[?#].*)?$/.test(u));
+  // A nested promo category is a subset of its top-level parent, so walking
+  // both just re-reads the same products; keep the child only when its parent
+  // isn't on the hub.
+  const promoCandidates = links
+    .map((url) => ({ url, segs: promoCategorySegments(url) }))
+    .filter((c) => c.segs && isListingKind(c.url, 'c'));
+  const topLevel = new Set(
+    promoCandidates.filter((c) => c.segs.length === 1).map((c) => c.segs[0].replace(/-promocion$/, '')),
+  );
+  const promoCategories = promoCandidates
+    .filter((c) => c.segs.length === 1 || !topLevel.has(c.segs[0]))
+    .map((c) => c.url);
+
+  console.log(`  found ${campaigns.length} campaign URLs`);
+  for (const u of campaigns) console.log('    ' + u);
+  console.log(`  found ${promoCategories.length} promo category URLs (of ${promoCandidates.length} linked)`);
+  for (const u of promoCategories) console.log('    ' + u);
+  return { campaigns, promoCategories };
 }
 
 // Each worker gets its own browser context — sharing one causes Carrefour's
@@ -649,7 +692,7 @@ if (require.main === module) (async () => {
 
   console.log('Carrefour scraper');
   console.log('  base URL:', baseUrl);
-  console.log('  mode:    ', isHub ? `hub (walk every /g campaign, ${workers} workers)` : 'single listing');
+  console.log('  mode:    ', isHub ? `hub (walk every /g campaign + promo category, ${workers} workers)` : 'single listing');
   console.log('  out:     ', `${OUT_DIR}/${outBase}.{json,csv,html,ai.json,report.md}`);
   console.log();
 
@@ -661,11 +704,14 @@ if (require.main === module) (async () => {
   try {
     // Discover campaign URLs (hub mode) using a throwaway worker page.
     let urls = [baseUrl];
+    let promoCategoryUrls = [];
     if (isHub) {
       const { page, close } = await newWorkerPage(browser);
       try {
-        urls = await discoverCampaignUrls(page, baseUrl);
-        if (urls.length === 0) throw new Error('No /g campaign URLs found on hub — is this really a hub page?');
+        ({ campaigns: urls, promoCategories: promoCategoryUrls } = await discoverCampaignUrls(page, baseUrl));
+        if (urls.length === 0 && promoCategoryUrls.length === 0) {
+          throw new Error('No /g campaigns and no -promocion /c categories found on hub — is this really a hub page?');
+        }
       } finally {
         await close();
       }
@@ -694,11 +740,16 @@ if (require.main === module) (async () => {
     const summaries = [];
     await scrapeCampaigns(browser, urls, ingest, summaries, workers);
 
-    // Pass 2 (hub mode) — headline promos reachable only via product badges
+    // Pass 2 (hub mode) — the standing discount catalog in the hub's promo
+    // category pages. Carries the bulk of the offers whenever the `/g` wave is
+    // between cycles, and overlaps it heavily otherwise (dedup absorbs that).
+    await scrapeCampaigns(browser, promoCategoryUrls, ingest, summaries, workers, 'promo category ');
+
+    // Pass 3 (hub mode) — headline promos reachable only via product badges
     // (`…/s`): "50% que vuelve", "super precio", "2ª unidad", etc. Discover them
     // from the products just scraped and walk the ones the hub didn't list.
     if (isHub) {
-      const promoUrls = discoverPromoCampaignsFromProducts([...seen.values()], urls);
+      const promoUrls = discoverPromoCampaignsFromProducts([...seen.values()], [...urls, ...promoCategoryUrls]);
       if (promoUrls.length) {
         console.log(`\nDiscovered ${promoUrls.length} promo campaign(s) from product badges (…/s)`);
         await scrapeCampaigns(browser, promoUrls, ingest, summaries, workers, 'promo ');
