@@ -31,7 +31,7 @@ COPY package.json package-lock.json ./
 # there is no copy to download at all.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 RUN npm ci
-COPY scrape.js analyze.js ./
+COPY scrape.js analyze.js probe.js ./
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome
 # Both bases already own uid 1000 (pptruser / node), so /output files land with
 # identical ownership whichever arch built the image.
