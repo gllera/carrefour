@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Scrape Carrefour offers and publish to $CARREFOUR_OUT (default:
-# ~/public/carrefour, served as a static site). The scrape runs here on
-# this box because carrefour.es challenges a datacenter address; ./publish-dmz.sh
-# then copies the finished files to the web server, which serves the page. See that script.
+# ~/public/carrefour, not served from this box). The scrape runs here
+# because carrefour.es challenges a datacenter address; ./publish-dmz.sh then
+# copies the finished files to the web server, which serves the page.
+# See that script.
 # The whole pipeline — no Claude needed. Pass --force to re-scrape the same day.
 # Rebuild the image first only if the repo changed: docker build -t carrefour-scraper .
 # The Dockerfile covers both architectures; no per-host build flags.
