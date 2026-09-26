@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Scrape Carrefour offers and publish to ~/public/carrefour.
+# Scrape Carrefour offers and publish to $CARREFOUR_OUT (default:
+# ~/public/carrefour, served as a static site). On the web server the pipeline
+# runs with its own CARREFOUR_OUT.
 # The whole pipeline — no Claude needed. Pass --force to re-scrape the same day.
 # Rebuild the image first only if the repo changed: docker build -t carrefour-scraper .
+# On aarch64 build with -f Dockerfile.arm64 — the base image differs.
 set -euo pipefail
 
-OUT=$HOME/public/carrefour
+OUT=${CARREFOUR_OUT:-$HOME/public/carrefour}
 
 docker run --rm -v "$OUT":/output carrefour-scraper "$@"
 
