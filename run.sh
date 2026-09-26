@@ -9,8 +9,9 @@
 # The Dockerfile covers both architectures; no per-host build flags.
 # SCRAPE_WORKERS caps the concurrent campaign workers (default 3).
 #
-# Every run is a full scrape (~20-40 min): the scraper's same-day cache lives in
-# its output dir, and that dir starts empty each time.
+# Every run is a full scrape (~20-40 min) and always republishes, even a
+# second run the same day. SCRAPE_FORCE=1 is pinned below so the scraper's
+# same-day cache can never short-circuit it (the temp dir starts empty anyway).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +23,7 @@ trap 'rm -rf "$OUT"' EXIT
 
 # -e without a value forwards the variable only when the caller actually set it,
 # so the container keeps scrape.js's own defaults otherwise.
-docker run --rm -v "$OUT":/output -e SCRAPE_WORKERS -e SCRAPE_FORCE carrefour-scraper "$@"
+docker run --rm -v "$OUT":/output -e SCRAPE_WORKERS -e SCRAPE_FORCE=1 carrefour-scraper "$@"
 
 # A fresh dir has no same-day cache, so a finished scrape always leaves
 # products.html; a missing one means the scrape did not complete.
