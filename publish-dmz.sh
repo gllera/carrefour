@@ -5,11 +5,11 @@
 # and answers a datacenter address with a Cloudflare interstitial. Measured
 # 2026-09-26 — ten fresh loads of the offers hub from each box, same script, same
 # minute: 403 "Just a moment..." 10/10 from the server, 200 10/10 from here. So only the
-# five output files travel. Run this right after run.sh; it is idempotent, and a
-# repeat run on an unchanged $CARREFOUR_OUT just re-uploads the same bytes.
+# five output files travel. run.sh calls this with CARREFOUR_OUT set to its temp
+# scrape dir; it is idempotent, so re-running it on the same dir is harmless.
 set -euo pipefail
 
-OUT=${CARREFOUR_OUT:-$HOME/public/carrefour}
+OUT=${CARREFOUR_OUT:?set CARREFOUR_OUT to the dir holding the five files (run.sh does)}
 DEST_HOST=${CARREFOUR_DMZ_HOST:-user@web-server}
 DEST_DIR=${CARREFOUR_DMZ_DIR:-/var/www/carrefour}
 

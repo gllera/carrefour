@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# Scrape Carrefour offers and publish to $CARREFOUR_OUT (default:
-# ~/public/carrefour, not served from this box). The scrape runs here
-# because carrefour.es challenges a datacenter address; ./publish-dmz.sh then
-# copies the finished files to the web server, which serves the page.
-# See that script.
-# The whole pipeline — no Claude needed. Pass --force to re-scrape the same day.
+# Scrape Carrefour offers into a throwaway temp dir, publish the five files to
+# the web server with ./publish-dmz.sh, then delete the temp
+# dir. Nothing is kept on this box: the web server holds the only copy.
+# The scrape runs on this box because carrefour.es challenges a datacenter
+# address; see publish-dmz.sh.
+# The whole pipeline — no Claude needed. Extra args go to scrape.js.
 # Rebuild the image first only if the repo changed: docker build -t carrefour-scraper .
 # The Dockerfile covers both architectures; no per-host build flags.
-# SCRAPE_WORKERS caps the concurrent campaign workers (default 3) — a box with
-# few cores wants less than that, e.g. SCRAPE_WORKERS=2 on four.
+# SCRAPE_WORKERS caps the concurrent campaign workers (default 3).
+#
+# Every run is a full scrape (~20-40 min): the scraper's same-day cache lives in
+# its output dir, and that dir starts empty each time.
 set -euo pipefail
 
-OUT=${CARREFOUR_OUT:-$HOME/public/carrefour}
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+# mktemp gives a 0700 dir owned by us (uid 1000), which is also the image's
+# uid, so the container can write into it. Removed on any exit, success or not.
+OUT=$(mktemp -d -t carrefour.XXXXXX)
+trap 'rm -rf "$OUT"' EXIT
 
 # -e without a value forwards the variable only when the caller actually set it,
 # so the container keeps scrape.js's own defaults otherwise.
 docker run --rm -v "$OUT":/output -e SCRAPE_WORKERS -e SCRAPE_FORCE carrefour-scraper "$@"
 
-# A skipped same-day run produces no products.html; keep the current page then.
-# The rename is the last thing this script does and `mv` within $OUT is atomic,
-# so index.html is never half-written — publish-dmz.sh reading $OUT mid-scrape
-# would copy the previous complete page, not a torn one.
-if [ -f "$OUT/products.html" ]; then
-  mv "$OUT/products.html" "$OUT/index.html"
-  echo "published → $OUT/index.html"
-else
-  echo "no new products.html (same-day cache) — index.html left as-is"
-fi
+# A fresh dir has no same-day cache, so a finished scrape always leaves
+# products.html; a missing one means the scrape did not complete.
+[ -f "$OUT/products.html" ] || { echo "$0: no products.html in $OUT — scrape did not finish" >&2; exit 1; }
+mv "$OUT/products.html" "$OUT/index.html"
+
+CARREFOUR_OUT="$OUT" "$HERE/publish-dmz.sh"
