@@ -37,6 +37,11 @@ const SALEPOINT = `${STORE_ID}||${POSTAL_CODE}|A_DOMICILIO|0`;
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 // One product card in a listing grid — the selector every page-walk step keys on.
 const SEL_CARD = '.product-card-list__item';
+// A listing with zero results still renders: the app swaps the populated grid
+// (`.product-card-list`) for a bare `.product-list` shell with no cards and no
+// pagination. It carries no "no results" copy, so this container is the only
+// positive signal that the page finished rendering and simply has nothing.
+const SEL_EMPTY_LIST = '.product-list';
 const PAGE_SIZE = 24;
 // Assumed page count when a listing shows no total (observed grids cap at ~40
 // pages; the walk stops early anyway on the first empty page).
@@ -45,6 +50,9 @@ const NAV_TIMEOUT_MS = 90_000;
 const SELECTOR_TIMEOUT_MS = 30_000;
 const HEAD_TIMEOUT_MS = 10_000;
 const RETRIES_PER_PAGE = 3;
+// Grace period given to the cards once the empty shell has appeared, before a
+// listing is believed to be genuinely empty (see waitForListing).
+const EMPTY_CONFIRM_MS = 8_000;
 const POLITE_DELAY_MS = 800;
 const POLITE_JITTER_MS = 600;
 const RATE_LIMIT_BACKOFF_MS = 15_000;
@@ -177,6 +185,27 @@ async function extractProducts(page) {
   }, ORIGIN, SEL_CARD);
 }
 
+// Waits for the listing to render and reports whether it came back empty.
+// Waiting on the card selector alone can't tell "no offers in this category"
+// apart from "the page never rendered", so a promo category that is simply out
+// of stock burned three 30s retries and was logged as a failed campaign
+// (mascotas-promocion and parafarmacia-promocion both did, every run since at
+// least 2026-09-06). Race the two containers instead — but never trust the
+// empty shell on sight, since it is also what the app paints before the cards
+// hydrate: give the cards a grace period and only then call the listing empty.
+// Neither container showing up is still a real failure and still retries.
+async function waitForListing(page) {
+  const sawEmpty = await Promise.any([
+    page.waitForSelector(SEL_CARD, { timeout: SELECTOR_TIMEOUT_MS }).then(() => false),
+    page.waitForSelector(SEL_EMPTY_LIST, { timeout: SELECTOR_TIMEOUT_MS }).then(() => true),
+  ]).catch(() => { throw new Error(`Waiting for selector \`${SEL_CARD}\` failed`); });
+  if (!sawEmpty) return false;
+  await page.waitForSelector(SEL_CARD, { timeout: EMPTY_CONFIRM_MS }).catch(() => {});
+  return (await page.$(SEL_CARD)) === null;
+}
+
+// Loads one listing page, retrying transient failures. Returns `{ empty }` —
+// true when the listing rendered with no products at all (see waitForListing).
 async function loadPage(page, url) {
   for (let attempt = 1; attempt <= RETRIES_PER_PAGE; attempt++) {
     try {
@@ -191,10 +220,10 @@ async function loadPage(page, url) {
         throw new Error(`HTTP ${status}`);
       }
       if (!status || status >= 400) throw new Error(`HTTP ${status}`);
-      await page.waitForSelector(SEL_CARD, { timeout: SELECTOR_TIMEOUT_MS });
+      if (await waitForListing(page)) return { empty: true };
       await autoScroll(page);
       await sleep(300 + Math.floor(Math.random() * 400));
-      return;
+      return { empty: false };
     } catch (e) {
       console.error(`  attempt ${attempt} failed: ${e.message}`);
       if (attempt === RETRIES_PER_PAGE) throw e;
@@ -436,7 +465,10 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
   const tag = workerId ? `[w${workerId}]` : '';
   const campaign = baseUrl.split('/')[4] || baseUrl;
   console.log(`\n${tag}=== ${campaign}`);
-  await loadPage(page, buildPageUrl(baseUrl, 0));
+  if ((await loadPage(page, buildPageUrl(baseUrl, 0))).empty) {
+    console.log(`${tag}  ${campaign}: no offers right now (empty listing)`);
+    return { url: baseUrl, total: 0, collected: 0, empty: true };
+  }
   const meta = await readPageMeta(page);
   const pageSize = meta.pageSize || meta.cardCount || PAGE_SIZE;
   const total = meta.total || (meta.cardCount * FALLBACK_MAX_PAGES);
@@ -449,8 +481,8 @@ async function scrapeListing(page, baseUrl, ingest, workerId = '') {
 
   for (let pageNumber = 2; pageNumber <= totalPages; pageNumber++) {
     try {
-      await loadPage(page, buildPageUrl(baseUrl, (pageNumber - 1) * pageSize));
-      const products = await extractProducts(page);
+      const { empty } = await loadPage(page, buildPageUrl(baseUrl, (pageNumber - 1) * pageSize));
+      const products = empty ? [] : await extractProducts(page);
       ingest(products, pageNumber, baseUrl);
       collected += products.length;
       if (products.length === 0) {
