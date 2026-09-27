@@ -8,6 +8,9 @@
 //   node scrape.js <url> <outputBasename>   # custom URL + custom output prefix
 //
 // Env:
+//   SCRAPE_POSTAL_CODE=NNNNN  postal code whose prices to scrape (required)
+//   SCRAPE_STORE_ID=NNNNNN    store to check product availability against
+//                             (optional; unset skips the check)
 //   SCRAPE_WORKERS=N   concurrent campaign workers in hub mode (default 3)
 //   SCRAPE_FORCE=1     re-scrape even if today's result is already cached
 //   OUT_DIR=dir        where outputs (and the same-day cache) live (default cwd)
@@ -24,15 +27,15 @@ const { buildAiPayload, renderReport, inferCategory, isVisible, eur, stripAccent
 
 const ORIGIN = 'https://www.carrefour.es';
 const DEFAULT_URL = `${ORIGIN}/supermercado/ofertas/cat20968591/c`;
-const POSTAL_CODE = '00000';
+const POSTAL_CODE = process.env.SCRAPE_POSTAL_CODE;
 // The promo grids list Carrefour's NATIONAL catalog, but each shopper is pinned
 // to one store ("sale point") whose assortment is only a subset. A product in a
 // grid but not in the store redirects to its category when opened — the "broken
 // links" a shopper hits. We reproduce the target store during link verification
 // (see verifyAccessibility) with this cookie so we can drop what they can't open.
 // Format: <storeId>||<postal>|<deliveryMode>|<n>, copied from a live session's
-// `salepoint` cookie. Change STORE_ID if the offers should target another store.
-const STORE_ID = '000000';
+// `salepoint` cookie. SCRAPE_STORE_ID picks the store; unset skips the check.
+const STORE_ID = process.env.SCRAPE_STORE_ID;
 const SALEPOINT = `${STORE_ID}||${POSTAL_CODE}|A_DOMICILIO|0`;
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 // One product card in a listing grid — the selector every page-walk step keys on.
@@ -691,6 +694,7 @@ function discoverPromoCampaignsFromProducts(products, alreadyScraped = []) {
 // Only run the scrape when invoked directly; when required as a module
 // (e.g. to regenerate the HTML from products.json) just expose the renderer.
 if (require.main === module) (async () => {
+  if (!POSTAL_CODE) throw new Error('SCRAPE_POSTAL_CODE is not set (see .env.example)');
   const rawArgs = process.argv.slice(2);
   const force = rawArgs.includes('--force') || ENV_FORCE;
   const positional = rawArgs.filter((a) => !a.startsWith('--'));
@@ -795,9 +799,14 @@ if (require.main === module) (async () => {
     // and would open as dead links (redirect to their category). Flag those so
     // the outputs drop them. products.json keeps every product (with the flag)
     // as the raw record; the presentation/analysis outputs hide accessible:false.
-    console.log('\nVerifying product links against store…');
-    const verif = await verifyAccessibility(browser, ordered);
-    console.log(`✓ verified ${verif.checked} links · ${verif.dead} not available in store (hidden)`);
+    let verif = { checked: 0, dead: 0 };
+    if (STORE_ID) {
+      console.log('\nVerifying product links against store…');
+      verif = await verifyAccessibility(browser, ordered);
+      console.log(`✓ verified ${verif.checked} links · ${verif.dead} not available in store (hidden)`);
+    } else {
+      console.log('\nSCRAPE_STORE_ID unset — skipping the store availability check');
+    }
 
     const reportedTotal = summaries.reduce((s, c) => s + (c.total || 0), 0);
     const jsonPath = outPath('json');

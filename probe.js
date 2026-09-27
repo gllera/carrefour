@@ -3,7 +3,7 @@
 // a residential IP answering says nothing about a datacenter one — run this
 // before assuming a new host can scrape at all. Two page loads, no output files.
 //
-//   node probe.js [url]
+//   SCRAPE_POSTAL_CODE=NNNNN node probe.js [url]
 //
 // Exits 0 and prints "VERDICT: served" when both pages return 200 and the
 // campaign grid renders product cards; exits 1 on a block, a challenge or an
@@ -16,7 +16,7 @@ puppeteer.use(StealthPlugin());
 
 const ORIGIN = 'https://www.carrefour.es';
 const HUB_URL = process.argv[2] || `${ORIGIN}/supermercado/ofertas/cat20968591/c`;
-const POSTAL_CODE = '00000';
+const POSTAL_CODE = process.env.SCRAPE_POSTAL_CODE;
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 const SEL_CARD = '.product-card-list__item';
 const NAV_TIMEOUT_MS = 90_000;
@@ -34,6 +34,10 @@ async function newPage(browser) {
 }
 
 (async () => {
+  if (!POSTAL_CODE) {
+    console.error('probe: SCRAPE_POSTAL_CODE is not set (see .env.example)');
+    process.exit(2);
+  }
   const browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],

@@ -22,6 +22,8 @@ Requiere Node.js 18+.
 ## Uso
 
 ```bash
+export SCRAPE_POSTAL_CODE=28001   # obligatorio: código postal de los precios
+
 # URL por defecto (ofertas del super), salida en ./products.{json,csv,html}
 node scrape.js
 
@@ -34,9 +36,13 @@ node scrape.js https://www.carrefour.es/.../g lacteos
 
 ### Variables de entorno
 
-| Variable          | Por defecto | Descripción                                    |
-|-------------------|-------------|------------------------------------------------|
-| `SCRAPE_WORKERS`  | `3`         | Workers concurrentes en modo hub               |
+| Variable             | Por defecto | Descripción                                                        |
+|----------------------|-------------|--------------------------------------------------------------------|
+| `SCRAPE_POSTAL_CODE` | —           | **Obligatoria.** Código postal cuyos precios se scrapean           |
+| `SCRAPE_STORE_ID`    | —           | Tienda contra la que se verifica la disponibilidad; sin ella no se verifica |
+| `SCRAPE_WORKERS`     | `3`         | Workers concurrentes en modo hub                                   |
+
+`run.sh` (scrape en Docker + publicación con `publish-dmz.sh`) las lee de `.env`, que git ignora: copia `.env.example` y rellénalo. Ahí van también el destino de la publicación (`CARREFOUR_DMZ_HOST`, `CARREFOUR_DMZ_DIR`).
 
 ## Salida
 
@@ -69,6 +75,6 @@ node analyze.js products.json salida     # prefijo de salida personalizado
 
 ## Notas
 
-- El código postal está fijado en el cookie `postalCode` (`POSTAL_CODE` en `scrape.js`) — cámbialo si necesitas precios de otra zona.
+- El código postal (`SCRAPE_POSTAL_CODE`) va en el cookie `postalCode`, y la tienda (`SCRAPE_STORE_ID`) en el cookie `salepoint` al verificar los enlaces: los listados son nacionales, y un producto que tu tienda no tiene redirige a su categoría, así que se oculta.
 - Las imágenes de los productos usan lazy-loading: el scraper lee `data-src` antes que `src` porque las imágenes de productos fuera del viewport nunca se cargan (los requests de imagen están bloqueados por velocidad).
 - Repositorio sin licencia explícita — uso personal/educativo. Respeta los `robots.txt` y los términos de servicio del sitio objetivo.
