@@ -77,4 +77,4 @@ node analyze.js products.json salida     # prefijo de salida personalizado
 
 - El código postal (`SCRAPE_POSTAL_CODE`) va en el cookie `postalCode`, y la tienda (`SCRAPE_STORE_ID`) en el cookie `salepoint` al verificar los enlaces: los listados son nacionales, y un producto que tu tienda no tiene redirige a su categoría, así que se oculta.
 - Las imágenes de los productos usan lazy-loading: el scraper lee `data-src` antes que `src` porque las imágenes de productos fuera del viewport nunca se cargan (los requests de imagen están bloqueados por velocidad).
-- Repositorio sin licencia explícita — uso personal/educativo. Respeta los `robots.txt` y los términos de servicio del sitio objetivo.
+- Licencia ISC (ver [`LICENSE`](LICENSE)), la misma que declara `package.json`. Respeta los `robots.txt` y los términos de servicio del sitio objetivo.
